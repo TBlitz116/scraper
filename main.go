@@ -26,47 +26,77 @@ type FacultyMember struct {
 	Email string
 }
 
-// Faculty page URLs to scrape.
-var facultyPages = []string{
+// CSEE faculty pages (structured as <a> links).
+var cseeFacultyPages = []string{
 	"https://www.csee.umbc.edu/people/tenure-track-faculty/",
 	"https://www.csee.umbc.edu/people/instructional-faculty/",
 }
 
-const directoryURL = "https://www2.umbc.edu/search/directory/"
-const department = "Computer Science and Electrical Engineering"
+// SE faculty page (structured as <p><strong>Name | Title</strong></p>).
+const seFacultyPage = "https://professionalprograms.umbc.edu/software-engineering/software-engineering-faculty/"
 
-// scrapeFacultyNames fetches faculty names and titles from CSEE department pages.
+const directoryURL = "https://www2.umbc.edu/search/directory/"
+const department = "CSEE / Software Engineering"
+
+func fetchHTMLPage(urlStr string) (*goquery.Document, error) {
+	req, err := newScraperGET(urlStr)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := scraperHTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch %s: %w", urlStr, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status %d from %s", resp.StatusCode, urlStr)
+	}
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse %s: %w", urlStr, err)
+	}
+	return doc, nil
+}
+
+// scrapeFacultyNames fetches faculty names and titles from CSEE and SE department pages.
 func scrapeFacultyNames() ([]FacultyMember, error) {
 	var faculty []FacultyMember
 	seen := make(map[string]bool)
 
-	for _, url := range facultyPages {
+	// --- Scrape CSEE pages ---
+	for _, url := range cseeFacultyPages {
 		fmt.Printf("Scraping %s ...\n", url)
 
-		resp, err := http.Get(url)
+		doc, err := fetchHTMLPage(url)
 		if err != nil {
-			return nil, fmt.Errorf("failed to fetch %s: %w", url, err)
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != 200 {
-			return nil, fmt.Errorf("status %d from %s", resp.StatusCode, url)
+			return nil, err
 		}
 
-		doc, err := goquery.NewDocumentFromReader(resp.Body)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse %s: %w", url, err)
-		}
+		// Faculty name links point to individual profile pages (not category pages)
+		// Filter: href must contain a faculty-specific path segment (not just /people/)
+		doc.Find("a").Each(func(i int, s *goquery.Selection) {
+			href, exists := s.Attr("href")
+			if !exists {
+				return
+			}
 
-		// Faculty entries: <a> tags with href containing '/people/' that have an <img> child
-		doc.Find("a[href*='/people/']").Each(func(i int, s *goquery.Selection) {
-			// Must contain an image
-			if s.Find("img").Length() == 0 {
+			// Must be a link to an individual faculty profile
+			isFacultyProfile := false
+			if strings.Contains(href, "/people/tenure-track-faculty/") && href != "https://www.csee.umbc.edu/people/tenure-track-faculty/" {
+				isFacultyProfile = true
+			}
+			if strings.Contains(href, "/people/instructional-faculty/") && href != "https://www.csee.umbc.edu/people/instructional-faculty/" {
+				isFacultyProfile = true
+			}
+			if strings.Contains(href, "/faculty/") && !strings.Contains(href, "/people/faculty-awards") {
+				isFacultyProfile = true
+			}
+			if !isFacultyProfile {
 				return
 			}
 
 			name := strings.TrimSpace(s.Text())
-			if name == "" {
+			if name == "" || len(name) > 50 {
 				return
 			}
 
@@ -76,12 +106,49 @@ func scrapeFacultyNames() ([]FacultyMember, error) {
 			}
 			seen[name] = true
 
-			// Try to get title from next sibling <p>
+			// Title is in the next sibling <p>
 			title := ""
 			next := s.Next()
 			if next.Is("p") {
 				title = strings.TrimSpace(next.Text())
 			}
+
+			faculty = append(faculty, FacultyMember{
+				Name:  name,
+				Title: title,
+			})
+		})
+	}
+
+	// --- Scrape SE faculty page ---
+	fmt.Printf("Scraping %s ...\n", seFacultyPage)
+	seDoc, seErr := fetchHTMLPage(seFacultyPage)
+	if seErr != nil {
+		fmt.Printf("  Warning: failed to fetch SE page: %v\n", seErr)
+	} else {
+		// SE faculty: <p><strong>Name, Degree | Title</strong></p>
+		seDoc.Find("p > strong").Each(func(i int, s *goquery.Selection) {
+			text := strings.TrimSpace(s.Text())
+			if text == "" || !strings.Contains(text, "|") {
+				return
+			}
+
+			parts := strings.SplitN(text, "|", 2)
+			nameRaw := strings.TrimSpace(parts[0])
+			title := strings.TrimSpace(parts[1])
+
+			// Remove degree suffixes like "Ph.D.", "J.D.", "M.B.A." from name
+			nameParts := strings.Split(nameRaw, ",")
+			name := strings.TrimSpace(nameParts[0])
+
+			if name == "" || len(name) > 50 {
+				return
+			}
+
+			if seen[name] {
+				return
+			}
+			seen[name] = true
 
 			faculty = append(faculty, FacultyMember{
 				Name:  name,
@@ -96,11 +163,7 @@ func scrapeFacultyNames() ([]FacultyMember, error) {
 
 // lookupEmail queries the UMBC directory for a faculty member's email.
 func lookupEmail(name string) string {
-	client := &http.Client{
-		Timeout: 15 * time.Second,
-	}
-
-	req, err := http.NewRequest("GET", directoryURL, nil)
+	req, err := newScraperGET(directoryURL)
 	if err != nil {
 		return ""
 	}
@@ -109,7 +172,7 @@ func lookupEmail(name string) string {
 	q.Set("search", name)
 	req.URL.RawQuery = q.Encode()
 
-	resp, err := client.Do(req)
+	resp, err := scraperHTTPClient.Do(req)
 	if err != nil {
 		fmt.Printf("  Warning: directory lookup failed for %s: %v\n", name, err)
 		return ""
@@ -151,8 +214,8 @@ func scrapeAll() ([]FacultyMember, error) {
 		}
 		fmt.Printf("  [%d/%d] %s -> %s\n", i+1, len(faculty), faculty[i].Name, status)
 
-		// Be polite to UMBC's server
-		time.Sleep(500 * time.Millisecond)
+		// Be polite to UMBC's server: ~500ms average with jitter
+		time.Sleep(politePause(350, 750))
 	}
 
 	fmt.Printf("\nDone. %d/%d emails found.\n", found, len(faculty))
@@ -168,6 +231,18 @@ func storeFaculty(faculty []FacultyMember) error {
 
 	// Convert async URL format if needed
 	dbURL = strings.Replace(dbURL, "postgresql+asyncpg://", "postgresql://", 1)
+	// For local Docker: replace internal hostname with localhost
+	dbURL = strings.Replace(dbURL, "@db:", "@localhost:", 1)
+	// For local Docker: use exposed port 5433
+	dbURL = strings.Replace(dbURL, ":5432/", ":5433/", 1)
+	// Disable SSL for local Docker
+	if !strings.Contains(dbURL, "sslmode=") {
+		if strings.Contains(dbURL, "?") {
+			dbURL += "&sslmode=disable"
+		} else {
+			dbURL += "?sslmode=disable"
+		}
+	}
 
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
