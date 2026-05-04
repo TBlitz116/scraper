@@ -304,14 +304,21 @@ func storeFaculty(faculty []FacultyMember) error {
 }
 
 func main() {
-	fmt.Println("=== UMBC Faculty Scraper (Go) ===\n")
-
-	// Load .env from backend
+	// Load .env from backend (used by both scrape and serve modes).
 	envPath := filepath.Join("..", "scheduler-backend", ".env")
 	if err := godotenv.Load(envPath); err != nil {
 		fmt.Printf("Warning: could not load %s: %v\n", envPath, err)
 		fmt.Println("Falling back to environment variables.")
 	}
+
+	if len(os.Args) > 1 && os.Args[1] == "serve" {
+		if err := runServer(); err != nil {
+			log.Fatalf("server failed: %v", err)
+		}
+		return
+	}
+
+	fmt.Println("=== UMBC Faculty Scraper (Go) ===\n")
 
 	faculty, err := scrapeAll()
 	if err != nil {
